@@ -1,0 +1,190 @@
+#!/bin/sh
+set -eu
+
+GLU_VERSION=0.1.0
+
+glu_root() {
+  glu_self=$0
+  while [ -L "$glu_self" ]; do
+    glu_link=$(readlink "$glu_self")
+    case $glu_link in
+      /*) glu_self=$glu_link ;;
+      *) glu_self=$(dirname "$glu_self")/$glu_link ;;
+    esac
+  done
+  cd "$(dirname "$glu_self")" && pwd -P
+}
+
+GLU_ROOT=$(glu_root)
+. "$GLU_ROOT/lib/ui.sh"
+. "$GLU_ROOT/lib/util.sh"
+. "$GLU_ROOT/lib/fetch.sh"
+. "$GLU_ROOT/lib/remote.sh"
+. "$GLU_ROOT/lib/tailscale.sh"
+. "$GLU_ROOT/lib/adguard.sh"
+
+usage() {
+  cat <<EOF
+glu $GLU_VERSION - verified Tailscale and AdGuard Home updates for GL.iNet routers
+
+Usage: glu [options] <command> [arguments]
+
+Commands:
+  status                         Show router versions, latest releases and checks
+  doctor [--url URL]             Check services, persistence and the port-forward rule
+  tailscale update               Download, verify and install the latest Tailscale
+  tailscale restore [backup|firmware]
+  adguard update                 Download, verify and install the latest AdGuard Home
+  adguard restore [backup|firmware]
+  netfix status|apply|remove     Manage the VPN + Tailscale port-forward reply rule
+  version                        Show the glu version
+
+Options:
+  -r, --router HOST    SSH target (default: \$GLU_ROUTER or root@192.168.8.1)
+  -n, --dry-run        Download, verify and test on the router; change nothing
+  -y, --yes            Do not ask for confirmation
+  -f, --force          Reinstall or downgrade to the target version
+      --version VER    Install this version instead of the latest one
+      --url URL        URL that doctor requests from the router
+      --no-gl-patch    Do not add --stateful-filtering=false to gl_tailscale
+  -h, --help           Show this help
+EOF
+}
+
+parse_arguments() {
+  GLU_ROUTER=${GLU_ROUTER:-root@192.168.8.1}
+  GLU_POSITIONAL=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -r | --router)
+        [ $# -ge 2 ] || die "$1 needs a value"
+        GLU_ROUTER=$2
+        shift
+        ;;
+      --version)
+        [ $# -ge 2 ] || die "$1 needs a value"
+        export GLU_TARGET_VERSION="$2"
+        shift
+        ;;
+      --url)
+        [ $# -ge 2 ] || die "$1 needs a value"
+        GLU_DOCTOR_URL=$2
+        shift
+        ;;
+      -n | --dry-run) export GLU_DRY_RUN=1 ;;
+      -y | --yes) export GLU_ASSUME_YES=1 ;;
+      -f | --force) export GLU_FORCE=1 ;;
+      --no-gl-patch) export GLU_GL_PATCH=0 ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*) die "unknown option: $1 (see glu --help)" ;;
+      *) GLU_POSITIONAL="$GLU_POSITIONAL $(shell_quote "$1")" ;;
+    esac
+    shift
+  done
+  for glu_rest in "$@"; do
+    GLU_POSITIONAL="$GLU_POSITIONAL $(shell_quote "$glu_rest")"
+  done
+}
+
+print_row() {
+  printf '  %-18s %s\n' "$1" "$2"
+}
+
+update_hint() {
+  if [ -z "$2" ]; then
+    echo "unknown"
+  elif [ -z "$1" ]; then
+    echo "$2 available"
+  elif version_gt "$2" "$1"; then
+    echo "$2 available (update with: glu $3 update)"
+  else
+    echo "$2 (up to date)"
+  fi
+}
+
+run_status() {
+  remote_facts
+  tailscale_resolve_target
+  adguard_resolve_target
+  info "Router $GLU_ROUTER"
+  print_row "model" "$(fact router.model) firmware $(fact router.firmware)"
+  print_row "Tailscale" "$(fact tailscale.version) (firmware $(fact tailscale.firmware_version), state $(fact tailscale.state), kept on upgrade: $(fact tailscale.persisted))"
+  print_row "  latest" "$(update_hint "$(fact tailscale.version)" "$TS_TARGET_VERSION" tailscale)"
+  print_row "AdGuard Home" "$(fact adguard.version) (firmware $(fact adguard.firmware_version), kept on upgrade: $(fact adguard.persisted))"
+  print_row "  latest" "$(update_hint "$(fact adguard.version)" "$AGH_TARGET_VERSION" adguard)"
+  print_row "port-forward fix" "needed $(fact netfix.needed), active $(fact netfix.live), saved $(fact netfix.saved)"
+  print_row "free space" "/overlay $(($(fact space.overlay_kb) / 1024)) MB, /tmp $(($(fact space.tmp_kb) / 1024)) MB"
+}
+
+run_component() {
+  glu_component=$1
+  glu_action=${2:-}
+  case $glu_action in
+    update) "${glu_component}_update" ;;
+    restore) "${glu_component}_restore" "${3:-backup}" ;;
+    *) die "usage: glu $glu_component update|restore [backup|firmware]" ;;
+  esac
+}
+
+run_netfix() {
+  glu_action=${1:-status}
+  case $glu_action in
+    status) remote_agent netfix status ;;
+    apply)
+      confirm "Add the port-forward reply rule on $GLU_ROUTER?" || die "cancelled"
+      remote_agent netfix apply
+      ;;
+    remove)
+      confirm "Remove the port-forward reply rule on $GLU_ROUTER?" || die "cancelled"
+      remote_agent netfix remove
+      ;;
+    *) die "usage: glu netfix status|apply|remove" ;;
+  esac
+}
+
+run_doctor() {
+  if [ -n "${GLU_DOCTOR_URL:-}" ]; then
+    remote_agent doctor "$GLU_DOCTOR_URL"
+  else
+    remote_agent doctor
+  fi
+}
+
+main() {
+  parse_arguments "$@"
+  eval "set -- $GLU_POSITIONAL"
+  [ $# -gt 0 ] || {
+    usage
+    exit 1
+  }
+  glu_command=$1
+  shift
+  case $glu_command in
+    help)
+      usage
+      return 0
+      ;;
+    version)
+      echo "glu $GLU_VERSION"
+      return 0
+      ;;
+  esac
+  require_commands ssh curl python3 awk sed mktemp
+  workdir_create
+  case $glu_command in
+    status) run_status ;;
+    doctor) run_doctor ;;
+    tailscale | adguard) run_component "$glu_command" "$@" ;;
+    netfix) run_netfix "$@" ;;
+    *) die "unknown command: $glu_command (see glu --help)" ;;
+  esac
+}
+
+main "$@"
