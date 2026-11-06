@@ -52,6 +52,19 @@ tailscale_ensure_gl_patch() {
   ok "added --stateful-filtering=false to gl_tailscale"
 }
 
+tailscale_warn_port_forward_conflict() {
+  ts_netfix=$(remote_agent netfix status) || return 0
+  printf '%s\n' "$ts_netfix" | grep -qx 'netfix.needed=yes' || return 0
+  if ! printf '%s\n' "$ts_netfix" | grep -qx 'netfix.live=yes'; then
+    warn "port forwards can fail on this router: a VPN client, Tailscale connection marks and port forwards are all active"
+    warn "replies from LAN servers are dropped (Cloudflare shows error 522); glu changed nothing for this"
+    warn "to add the reply rule, run: glu netfix apply (see README, 'The port-forward fix')"
+  elif ! printf '%s\n' "$ts_netfix" | grep -qx 'netfix.saved=yes'; then
+    warn "the port-forward reply rule is active but not saved, so a reboot removes it"
+    warn "to save it, run: glu netfix apply"
+  fi
+}
+
 tailscale_update() {
   remote_facts
   ts_current=$(fact tailscale.version)
@@ -60,6 +73,7 @@ tailscale_update() {
   if [ "${GLU_FORCE:-0}" != 1 ] && [ -n "$ts_current" ] && ! version_gt "$TS_TARGET_VERSION" "$ts_current"; then
     ok "Tailscale is already at $ts_current; use --force to reinstall or downgrade"
     tailscale_ensure_gl_patch
+    tailscale_warn_port_forward_conflict
     return 0
   fi
   [ "${GLU_DRY_RUN:-0}" = 1 ] || confirm "Install Tailscale $TS_TARGET_VERSION on $GLU_ROUTER?" || die "cancelled"
@@ -71,10 +85,12 @@ tailscale_update() {
   [ "${GLU_DRY_RUN:-0}" = 1 ] && set -- "$@" --dry-run
   [ "${GLU_GL_PATCH:-1}" = 1 ] || set -- "$@" --no-gl-patch
   remote_agent "$@"
+  tailscale_warn_port_forward_conflict
 }
 
 tailscale_restore() {
   ts_source=${1:-backup}
   confirm "Restore Tailscale from the $ts_source copy on $GLU_ROUTER?" || die "cancelled"
   remote_agent restore-tailscale "$ts_source"
+  tailscale_warn_port_forward_conflict
 }

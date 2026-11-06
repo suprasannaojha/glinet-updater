@@ -102,7 +102,8 @@ On GL.iNet firmware 4.9 and later, port forwards and replies can fail when **all
 Then each reply from the LAN server is dropped. Cloudflare shows **error 522**.
 
 `glu netfix apply` adds `ip rule fwmark 0x10000/0xfff000 lookup main` at priority 5990. Replies of port-forwarded connections then go out through the WAN. VPN traffic and port forwards that come in through the VPN do not change.
-`glu doctor` reports when you need the rule.
+
+The rule is separate from the updates. `glu tailscale update` and `glu tailscale restore` never add it. After they finish, they read the router state and print a warning if the rule is needed but missing or not saved. `glu doctor` reports the same.
 
 ## After a firmware upgrade
 
